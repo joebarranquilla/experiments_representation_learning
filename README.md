@@ -6,6 +6,24 @@ Benchmarking techniques on representation learning. This repository explores cla
 
 Representation learning aims to discover useful structure in data through unsupervised or self-supervised learning. This project implements and compares several key techniques across different domains.
 
+## Setup
+
+Create and activate a conda environment named `rl-experiments`:
+
+```bash
+conda create -n rl-experiments python=3.11 -y
+conda activate rl-experiments
+```
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+To deactivate the environment when you're done:
+
+
 ## Techniques
 
 ### Principal Component Analysis (PCA)
