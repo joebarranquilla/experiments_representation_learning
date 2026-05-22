@@ -84,9 +84,28 @@ class PCA:
 # Example usage
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example dataset: 2000 samples, 5 features
+    # Example: use CIFAR-10 images (flattened) as dataset
+    from torchvision.datasets import CIFAR10
+    from torchvision.transforms import ToTensor
+
+    dataset = CIFAR10(root="data", train=True, download=True, transform=ToTensor())
+
+    # Convert to numpy and use a subset for speed; also collect labels
+    X_list = []
+    y_list = []
+    for img, label in dataset:
+        arr = img.numpy()
+        arr = np.transpose(arr, (1, 2, 0)).reshape(-1)
+        X_list.append(arr)
+        y_list.append(label)
+    X_all = np.vstack(X_list)
+    y_all = np.array(y_list)
+
     np.random.seed(42)
-    X = np.random.randn(2000, 5)
+    n_samples = min(2000, X_all.shape[0])
+    idx = np.random.choice(X_all.shape[0], n_samples, replace=False)
+    X = X_all[idx]
+    y = y_all[idx]
 
     # Reduce to 2 dimensions
     pca = PCA(n_components=2)
@@ -113,20 +132,34 @@ if __name__ == "__main__":
     # Compute t-SNE embedding (might take a bit of time for large datasets)
     X_embedded = TSNE(n_components=2, random_state=42).fit_transform(X)
 
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(14, 6))
 
-    # Left: PCA reduced data
+    cmap = plt.get_cmap("tab10")
+    class_names = dataset.classes
+
+    # Left: PCA reduced data colored by label
     plt.subplot(1, 2, 1)
-    plt.scatter(X_reduced[:, 0], X_reduced[:, 1], s=8, alpha=0.7)
-    plt.title("PCA: Reduced Data")
+    scatter = plt.scatter(
+        X_reduced[:, 0], X_reduced[:, 1], c=y, cmap=cmap, s=8, alpha=0.8
+    )
+    plt.title("PCA: Reduced Data (colored by class)")
     plt.xlabel("Principal Component 1")
     plt.ylabel("Principal Component 2")
     plt.grid(True)
 
-    # Right: t-SNE on original data
+    # Add a legend for classes
+    handles = []
+    for i, cname in enumerate(class_names):
+        handles.append(plt.Line2D([0], [0], marker="o", color="w", label=cname,
+                                  markerfacecolor=cmap(i), markersize=6))
+    plt.legend(handles=handles, loc="best", fontsize="small")
+
+    # Right: t-SNE on original data colored by label
     plt.subplot(1, 2, 2)
-    plt.scatter(X_embedded[:, 0], X_embedded[:, 1], s=8, alpha=0.7, color="C1")
-    plt.title("t-SNE: Original Data")
+    plt.scatter(
+        X_embedded[:, 0], X_embedded[:, 1], c=y, cmap=cmap, s=8, alpha=0.8
+    )
+    plt.title("t-SNE: Original Data (colored by class)")
     plt.xlabel("t-SNE Component 1")
     plt.ylabel("t-SNE Component 2")
     plt.grid(True)
