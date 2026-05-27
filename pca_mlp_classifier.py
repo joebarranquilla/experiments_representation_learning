@@ -2,73 +2,65 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
+from torchvision import transforms
 from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split
 import time
 import matplotlib.pyplot as plt
+from utils import visualize_probe_predictions
 
 
-def load_and_preprocess_cifar10(n_samples=None, test_size=0.2, val_size=0.2):
+def load_and_preprocess_cifar10(data_root="data", val_fraction=0.1):
     """
     Load CIFAR-10, flatten images, and split into train/val/test.
 
+    Mirrors utils.get_cifar10_loaders: the 50K training set is split with a
+    fixed seed (42) via torch.randperm, and the official 10K test set is kept
+    separate.  No sklearn train_test_split is used.
+
     Parameters
     ----------
-    n_samples : int or None
-        Number of samples to use (subsample for speed). None uses all.
-    test_size : float
-        Fraction of data to use for testing.
-    val_size : float
-        Fraction of the full dataset to use for validation.
+    data_root : str
+        Directory where CIFAR-10 is downloaded / cached.
+    val_fraction : float
+        Fraction of the 50K training set to hold out for validation.
 
     Returns
     -------
-    X_train, X_val, X_test, y_train, y_val, y_test : ndarrays
-        Flattened image data and labels.
+    X_train, X_val, X_test : float32 ndarrays, shape (N, 3072)
+    y_train, y_val, y_test : int64 ndarrays, shape (N,)
     """
+    to_tensor = transforms.ToTensor()
+
+    train_ds = CIFAR10(root=data_root, train=True,  download=True, transform=to_tensor)
+    test_ds  = CIFAR10(root=data_root, train=False, download=True, transform=to_tensor)
+
+    def _dataset_to_arrays(ds):
+        X, y = [], []
+        for img, label in ds:
+            X.append(img.numpy().transpose(1, 2, 0).reshape(-1))
+            y.append(label)
+        return np.vstack(X).astype(np.float32), np.array(y, dtype=np.int64)
+
     print("Loading CIFAR-10...")
-    dataset = CIFAR10(root="data", train=True, download=True, transform=ToTensor())
+    X_all, y_all = _dataset_to_arrays(train_ds)
+    X_test, y_test = _dataset_to_arrays(test_ds)
 
-    # Convert to numpy and flatten images
-    X_list = []
-    y_list = []
-    for img, label in dataset:
-        arr = img.numpy()
-        arr = np.transpose(arr, (1, 2, 0)).reshape(-1)
-        X_list.append(arr)
-        y_list.append(label)
+    # Reproducible train/val split — identical seed to utils.py
+    n_val   = int(len(X_all) * val_fraction)
+    n_train = len(X_all) - n_val
+    indices = torch.randperm(
+        len(X_all), generator=torch.Generator().manual_seed(42)
+    ).tolist()
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
 
-    X = np.vstack(X_list)
-    y = np.array(y_list)
-
-    # Subsample if requested (use global RNG)
-    if n_samples is not None and n_samples < X.shape[0]:
-        idx = np.random.choice(X.shape[0], n_samples, replace=False)
-        X = X[idx]
-        y = y[idx]
-
-    # First split off the test set
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y
-    )
-
-    # Now split the remaining data into train and validation
-    if val_size is not None and val_size > 0:
-        val_rel = val_size / (1.0 - test_size)
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp, test_size=val_rel, stratify=y_temp
-        )
-    else:
-        X_train, y_train = X_temp, y_temp
-        X_val, y_val = None, None
+    X_train, y_train = X_all[train_idx], y_all[train_idx]
+    X_val,   y_val   = X_all[val_idx],   y_all[val_idx]
 
     print(f"  Train: {X_train.shape[0]} samples, {X_train.shape[1]} features")
-    if X_val is not None:
-        print(f"  Val: {X_val.shape[0]} samples")
-    print(f"  Test: {X_test.shape[0]} samples")
+    print(f"  Val:   {X_val.shape[0]} samples")
+    print(f"  Test:  {X_test.shape[0]} samples")
 
     return X_train, X_val, X_test, y_train, y_val, y_test
 
@@ -95,6 +87,28 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.network(x)
+
+
+class PCAClassifier(nn.Module):
+    """
+    Wraps a fitted sklearn PCA + a trained MLP so the combined model accepts
+    raw image tensors of shape (B, 3, 32, 32) in [0, 1].
+
+    This makes it a drop-in for visualize_probe_predictions from utils.py,
+    which calls probe(imgs) where imgs come from a standard CIFAR-10 loader.
+    """
+
+    def __init__(self, pca, mlp: nn.Module):
+        super().__init__()
+        self.pca = pca          # sklearn PCA (not a nn.Module)
+        self.mlp = mlp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, 32, 32)  →  flatten to (B, 3072)  →  PCA  →  MLP logits
+        flat  = x.cpu().numpy().transpose(0, 2, 3, 1).reshape(x.shape[0], -1)
+        feats = torch.from_numpy(self.pca.transform(flat).astype(np.float32))
+        feats = feats.to(next(self.mlp.parameters()).device)
+        return self.mlp(feats)
 
 
 def train_epoch(model, train_loader, criterion, optimizer, device):
@@ -144,63 +158,13 @@ def evaluate(model, data_loader, device, return_loss=False, criterion=None):
     return acc
 
 
-def visualize_predictions(model, X_test_flat, X_test_pca, y_test, device, classes, num_images=16):
-    """Plot a grid of test images with true and predicted labels.
-
-    Parameters
-    - model: torch model that expects PCA features input (MLP)
-    - X_test_flat: numpy array of flattened images (H,W,C flattened)
-    - X_test_pca: numpy array of PCA-transformed features for test set
-    - y_test: numpy array of integer labels
-    - device: torch device
-    - classes: list of class names
-    - num_images: how many images to display (will form roughly square grid)
-    """
-    model.eval()
-    n = X_test_flat.shape[0]
-    num_images = min(num_images, n)
-    idxs = np.random.choice(n, num_images, replace=False)
-
-    # Prepare inputs for model (PCA features)
-    X_sel_pca = X_test_pca[idxs]
-    X_tensor = torch.from_numpy(X_sel_pca).float().to(device)
-    with torch.no_grad():
-        logits = model(X_tensor)
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-
-    # Plot grid
-    cols = int(np.ceil(np.sqrt(num_images)))
-    rows = int(np.ceil(num_images / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
-    axes = axes.flatten()
-
-    for i, ax in enumerate(axes):
-        if i >= num_images:
-            ax.axis('off')
-            continue
-
-        idx = idxs[i]
-        img_flat = X_test_flat[idx]
-        # reshape back to H,W,C where H=W=32
-        img = img_flat.reshape(32, 32, 3)
-
-        true_lbl = int(y_test[idx])
-        pred_lbl = int(preds[i])
-
-        ax.imshow(img)
-        title = f"T: {classes[true_lbl]}\nP: {classes[pred_lbl]}"
-        color = 'green' if true_lbl == pred_lbl else 'red'
-        ax.set_title(title, color=color, fontsize=8)
-        ax.axis('off')
-
-    plt.tight_layout()
-    plt.show()
+# visualize_predictions is provided by utils.visualize_probe_predictions via
+# the PCAClassifier wrapper — no local duplicate needed.
 
 
 def main():
     # Hyperparameters
     n_components = 80  # Increased PCA components to capture more variance
-    n_samples = 20000
     batch_size = 64
     num_epochs = 100
     learning_rate = 1e-3
@@ -209,11 +173,10 @@ def main():
 
     print(f"Using device: {device}")
     print(f"PCA n_components: {n_components}")
-    print(f"Total samples: {n_samples}")
 
     # Load and preprocess data (train/val/test)
     X_train, X_val, X_test, y_train, y_val, y_test = load_and_preprocess_cifar10(
-        n_samples=n_samples, test_size=0.2, val_size=0.2
+        data_root="data", val_fraction=0.1
     )
 
     # Apply PCA
@@ -321,16 +284,25 @@ def main():
         print(f"Final Val Accuracy:   {val_acc:.4f}")
     print(f"Final Test Accuracy:  {test_acc:.4f}")
 
-    # Visualize some test images with true vs predicted labels
-    try:
-        dataset_all = CIFAR10(root="data", train=True, download=False)
-        classes = dataset_all.classes
-    except Exception:
-        # fallback labels
-        classes = [str(i) for i in range(10)]
+    # ── Visualise predictions using the shared utils helper ──────────────────
+    # Reconstruct image tensors (N, 3, 32, 32) from the flat arrays so the
+    # standard image DataLoader that visualize_probe_predictions expects works.
+    import os
+    os.makedirs("outputs", exist_ok=True)
 
-    # X_test (flattened) and X_test_pca are available from above
-    visualize_predictions(model, X_test, X_test_pca, y_test, device, classes, num_images=16)
+    X_test_imgs = torch.from_numpy(
+        X_test.reshape(-1, 32, 32, 3).transpose(0, 3, 1, 2)  # (N, C, H, W)
+    )
+    viz_loader = DataLoader(
+        TensorDataset(X_test_imgs, torch.from_numpy(y_test).long()),
+        batch_size=64, shuffle=False,
+    )
+    pca_wrapper = PCAClassifier(pca, model)
+    visualize_probe_predictions(
+        pca_wrapper, viz_loader, device,
+        title='PCA + MLP – Test Predictions',
+        save_path='outputs/pca_mlp_predictions.png',
+    )
 
 
 if __name__ == "__main__":
